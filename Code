@@ -1,0 +1,390 @@
+
+import pandas as pd
+from tkinter import *
+import win32com.client
+from datetime import datetime
+import re
+from pandastable import Table
+import sys
+import openpyxl
+import os
+
+# load MCH database:
+
+df = pd.read_csv( '\\path\\database.csv', encoding='unicode_escape')
+df.UCI = df.UCI.astype(str)
+df.index = df['UCI']
+
+# load the archive file storing the status of requests
+df2 = pd.read_excel( '\\path\\BU_comms_archive.xlsx', encoding='unicode_escape', )
+
+# since dates column with N/A automatically load as Not a Number(NaN), lets change them back into the strings we need:
+df2 = df2.fillna('N/A')
+df2.UCI = df2.UCI.astype(str)
+
+# df2.index=df2['UCI']
+class class1(Frame):
+
+    def __init__(self, window, df, df2):
+        # Creating GUI window:
+        self.window = window
+        self.df = df
+        self.df2 = df2
+
+        # three placeholders:
+        global emailer_option
+        global to_append
+        global marker
+        self.done = False
+        marker = None
+        to_append = None
+        emailer_option = '0'
+        window.title("Automated e-mail sender v. 0.2")
+        window.geometry('300x150')
+        # Creating input entries:
+        self.label = Label(self.window, text="UCI").pack(side='left')
+        self.uci = Entry(self.window)
+        self.uci.pack(side='left')
+
+        # Button that calls fetch_values:
+        self.set_button = Button(self.window, text='Enter the UCI', command=self.fetch_values) \
+            .pack(side='left')
+
+    def quit_button(self):
+        self.set_button = Button(self.window, text='Quit', command=root.destroy) \
+            .pack(side='left', expand=True)
+
+    # mark the request for this uci as 'resolved'
+    def resolved_button(self):
+        try:
+            os.chdir('\\path\\data_pull_folder')
+            wb = openpyxl.load_workbook('BU_comms_archive.xlsx')
+            worksheet = wb.active
+            seconddatecolumn = self.column_number_finder('Resolved', worksheet)
+            rownumber = self.row_number_finder(self.uci, worksheet)
+            worksheet.cell(column=seconddatecolumn, row=rownumber).value = 'Y'
+            wb.save(filename='BU_comms_archive.xlsx')
+            self.prompt_window('Resolved status has been successfully changed to Y in BU_comms_archive spreadsheet')
+        except PermissionError:
+            self.error_window('Archive is open')
+
+
+    def error_window(self, issue):
+        self.issue = issue
+        self.window = Toplevel(root)  # opens up a new window on top of the previous one
+        self.window.geometry('650x200')
+        if self.issue == 'UCI not found':
+            self.prompt = """UCI was not found in the database. Make sure there are no spaces in the
+                UCI field or try again with a different UCI. Please close the app and start again."""
+        elif self.issue == 'Archive is open':
+            self.prompt = """The application was not able to access the archive file. Please close the BU_comms_archive file and try again.
+                Alternatively, reach out to someone else who opened the file or reach out to name@gmail.com for help."""
+        elif self.issue == '3 emails':
+            self.prompt = "There have been THREE e-mails sent already. Perhaps other steps should be taken rather then another chase."
+        elif self.issue == 'Resolved':
+            self.prompt = """Archives show the request for this UCI has been resolved. If there is a further need for requests, go to the archives and
+                and change the resolved/issue columns manually."""
+        self.window.title('Error!')
+        self.label = Label(self.window, text=self.prompt).pack(expand=True)
+        self.quit_button()
+        return
+
+
+    # build a string of recipients
+    def recipient_function(self, df, option=1):
+        # firstly, let us filter out contacts to accounts that are likely closed:
+        # the list of terms in the account name suggesting there is no need to contact particular group managing the account:
+        searchfor = ['CLOSED', 'CLSD', 'INACTIVE']
+
+        # '~' returns the opposite booleans
+        selector = (~df.MCH_NAME.str.contains('|'.join(searchfor), na=False))
+        df = df.loc[selector]
+        selector = (~df.ADV_REP.str.contains('|'.join(searchfor), na=False))
+        df = df.loc[selector]
+
+        # check if there are any open accounts:
+        if len(df['MCH_NAME']) == 0:
+            self.prompt_window('All accounts seem to be closed. No need for contacting the business.')
+            return
+
+        # get the data while removing NaNs and duplicated contacts:
+        self.recipient = list(
+            self.nan_remover_from_list(list(df.CS_GROUP.unique())) + self.nan_remover_from_list(list(df.CS_MGR.unique()))
+            + self.nan_remover_from_list(list(df.ACTG_MGR.unique())))
+        self.recipient = str(list(set(self.recipient)))
+
+        # scenario for second chase and escalation:
+        if option == 2:
+            self.recipient = self.recipient + str(self.nan_remover_from_list(list(df.UNIT_HEAD_1.unique())))
+        # remove "'" as well as square brackets:
+        self.recipient = ''.join(self.recipient).replace("'", "; ")
+        self.recipient = self.recipient.replace('[', '').replace(']', '')
+        return self.recipient
+
+    # find an index number of a 'column'
+
+    def column_number_finder(self, column, worksheet):
+        self.column = column
+        for cell in worksheet[1]:
+            if cell.value == self.column:
+                self.seconddatecolumn = cell.column
+        return self.seconddatecolumn
+
+
+    # find an index number of a a row in a column 'A' matching the 'uci' value
+    def row_number_finder(self, uci, worksheet):
+        for cell in worksheet['A']:
+            if cell.value == uci:
+                self.rownumber = cell.row
+        return self.rownumber
+
+    def nan_remover_from_list(self, entry):
+        self.entry = entry
+        self.newlist = []
+        for item in self.entry:
+            if pd.isnull(item) == False:
+                self.newlist.append(item)
+        return self.newlist
+
+    # the e-mailer:
+    def Emailer(self, df, df2, reqdoc):  # reqdoc stands for required documentation
+        # load data needed for an e-mail, reshape both dataframes to contain only rows with our identifier:
+        self.df = df[df['UCI'] == self.uci]
+        self.df2 = df2[df2['UCI'] == self.uci]
+        self.reqdoc = reqdoc
+        self.CPname = str(self.df['CP_NAME'].iloc[0])
+        self.accounts = list(self.df['MCH'])
+        self.recipient = self.recipient_function(self.df)
+
+        # change the current working directory to be able to wrangle with Bu comms spreadsheet
+        os.chdir('\\path\\MCH BCAD pull')
+        try:
+            # three scenarios:
+            # 1st, this is a first request (or not recorder yet in BU comms archive file):
+            if len(self.df2[self.df2.UCI == self.uci]) == 0:
+                self.firsttime = True
+
+                # change the contact details into a nice Excel string form:
+                self.subject = self.CPname + ' documentation/status request for UCI ' + str(self.uci) + ' 1st contact'
+
+                # global variable have been introduced as they significantly simplify the code and the size of the app allows it
+                global emailer_option
+                emailer_option = '1'
+
+            # 2nd, it is the first chase:
+            else:
+
+                # the request for this UCI already exists in archives, let's make sure it is not resolved yet
+                if str(self.df2['Resolved'].iloc[0]) == 'Y':
+                    self.error_window('Resolved')
+
+                    # sys.exit() - used to produce an error
+
+                    return
+                self.firsttime = False
+                if str(self.df2['2nd_contact_date'].iloc[0]) == 'N/A':
+                    self.subject = self.CPname + ' documentation/status request for UCI ' + str(self.uci) + ' 2nd contact'
+                    emailer_option = '2'
+
+                    # global variable has been introduced as it significantly simplifies the code.
+                    # the global variable is declared in this unusual place as to_append is input to archiver function,
+                    # therefore it needs to exist,even as a None value
+                    # to_append = None - old
+
+                # 3rd scenario, it a second chase email, let us add department heads as recipients:
+                else:
+                    if str(self.df2['3rd_contact_date'].iloc[0]) != 'N/A':
+                        self.error_window('3 emails')
+                        return
+
+                        # sys.exit() - used to produce an error
+                    # call recipient function with option=2 in order to add escalation contacts:
+                    self.recipient = self.recipient_function(self.df, 2)
+                    self.subject = self.CPname + ' documentation/status request for UCI ' + str(self.uci) + ' 3rd contact'
+                    emailer_option = '3'
+
+                    # to_append = None - old
+            # text for the e-mail body:
+            self.text = (r"""Hello, <br><br>
+                 For  Risk purposes,
+                 could you please provide with a copy of """ + self.reqdoc +
+                         """ for: """ + self.CPname + """, account(s) linked: """
+                         + "<b>" + str(self.accounts) + "</b>" + """? <br>     </a><br>
+                 Alternatively,  please confirm the client left the company""")
+
+            # explicitly set the font type and size :
+            self.text = text = '<font face="Calibri" size = "3">' + self.text + '</font>'
+
+            # call outlook instance:
+            outlook = win32com.client.Dispatch('outlook.application')
+            # enter the 'create e-mail draft' option in Outlook:
+            mail = outlook.CreateItem(0)
+            mail.To = self.recipient
+            mail.Subject = self.subject
+
+            # GetInspector is an important part that enables you to access the default signature
+            # and it will likely not work with a newer Outlook version:
+            mail.GetInspector
+
+            # access the e-mail address of current outlook instance (sender's address):
+            self.sender = []
+            for item in outlook.Session.Accounts:
+                self.sender.append(item)
+            self.sender = str(self.sender[0])
+
+            # concatenate the body with the signature
+            mail.HTMLbody = self.text + mail.HTMLbody
+
+            # the below makes sure we are appending rater's name
+            if self.firsttime == True:
+                global to_append
+                to_append = [self.uci, self.CPname, self.recipient.replace(';', ''), self.sender,
+                             self.reqdoc, str(datetime.today().strftime('%m-%d-%Y')), 'N/A', 'N/A', 'N']
+
+            # mail.display opens up draft e-mail ready to be amended/sent:
+            mail.Display(True)
+        # 'excel archive file is open' exception handler:
+        except PermissionError:
+            self.error_window('Archive is open')
+
+    # open up a new window on top of other windows without closing the app:
+
+    def prompt_window(self, text):
+        self.text = text
+        self.window = Toplevel(root)  # opens up a new window on top of the previous one
+        self.window.geometry('650x200')
+        self.window.title('WARNING!')
+        self.label = Label(self.window, text=self.text).pack(expand=True)
+
+    def archiver(self, option, to_append):
+        if self.done == True:
+            self.prompt_window("You already archived the request")
+        else:
+            self.option = option
+            self.append_row = to_append
+
+            # change the current working directory to be able to wrangle with Bu comms spreadsheet
+            os.chdir('\\filepath\\MCH BCAD pull')
+            try:
+                wb = openpyxl.load_workbook('BU_comms_archive.xlsx')
+                worksheet = wb.active
+                if self.option == '0':
+                    self.prompt_window("""In order to archive the request sent, please click on another button opening an e-mail draft to make sure the app
+                        loads necessary data needed for archive file.""")
+                else:
+                    if self.option == '1':
+                        worksheet.append(self.append_row)
+                    elif self.option == '2':
+
+                        # find the index number of column 2nd_contact_date:
+                        seconddatecolumn = self.column_number_finder('2nd_contact_date', worksheet)
+
+                        # handle Anaconda exception returning the column letter instead of its index:
+                        if type(seconddatecolumn) == str:
+                            seconddatecolumn = 7
+                        # find the index number of row containing uci
+
+                        rownumber = self.row_number_finder(str(self.uci), worksheet)
+                        worksheet.cell(column=seconddatecolumn, row=rownumber).value = str(
+                            datetime.today().strftime('%m-%d-%Y'))
+                    elif self.option == '3':
+                        seconddatecolumn = self.column_number_finder('3rd_contact_date', worksheet)
+
+                        # handle Anaconda exception returning the column letter instead of its index:
+                        if type(seconddatecolumn) == str:
+                            seconddatecolumn = 8
+                        rownumber = self.row_number_finder(str(self.uci), worksheet)
+                        worksheet.cell(column=seconddatecolumn, row=rownumber).value = str(
+                            datetime.today().strftime('%m-%d-%Y'))
+                    wb.save(filename='BU_comms_archive.xlsx')
+                    self.prompt_window('BU_comms_archive spreadsheet has been updated successfully. ')
+                    self.done = True
+
+            except PermissionError:
+                self.error_window('Archive is open')
+
+    # destroy the GUI and load it again to enable multiple searches
+
+    def back_button(self):
+        root.destroy()
+        global marker
+        marker = True
+
+    def not_found(self, text):
+        self.text = text
+        self.prompt_window(self.text)
+        self.set_button = Button(self.window, text='Back to UCI search', command=self.back_button) \
+            .pack(side='left', expand=True)
+
+    # Fetching input entries:
+    def fetch_values(self):
+        global to_append
+        global emailer_option
+        self.uci = str(self.uci.get())
+
+        # remove spaces from user's input
+        self.uci = self.uci.replace(" ", "")
+        Frame.__init__(self)
+        # UCI is not in the dataframe:
+        if len(self.df[self.df.UCI == self.uci]) == 0:
+            self.not_found('UCI not found in the database')
+        # UCI was found:
+        else:
+
+            # filter by input UCI
+            self.df = self.df.loc[self.uci]
+
+            # check if the outcome is a dataframe (UCIs having a single account linked may be changed into
+            # pandas series object type with incorrect shape [will need to be transposed later]):
+            if isinstance(self.df, pd.DataFrame):
+                pass
+
+            # if it is not a dataframe, change it a dataframe and use T method (transpose).
+            else:
+                self.df = pd.Series.to_frame(self.df).T
+            self.window = Toplevel(root)
+            self.window.geometry('1500x400+100+100')
+            self.window.title('MCH accounts linked:')
+            f = Frame(self.window)
+            f.pack(fill=BOTH, expand=1)
+            self.table = pt = Table(f, dataframe=self.df, showtoolbar=False, showstatusbar=False)
+            pt.show()
+
+            # lambda in the button commands below is necessary as without the lambda, the parameters fiven for the
+            # function Emailer would make the function go without the button clicked. Thanks to lambda input there,
+            # the function Emailer runs only AFTER clicked, not when fetch_values is called
+
+            self.set_button = Button(self.window, text='Ask for a custody agreement',
+                                     command=lambda: self.Emailer(self.df, self.df2, 'Custody Agreement')) \
+                .pack(side='left', expand=True)
+
+            self.set_button = Button(self.window, text='Ask for financial statements/confirmation it is a live client',
+                                 command=lambda: self.Emailer(self.df, self.df2, 'Financial Statements/Annual Report')) \
+            .pack(side='left', expand=True)
+
+            self.set_button = Button(self.window, text='Confirm the e-mail was sent and archive it',
+                             command=lambda: self.archiver(emailer_option, to_append)) \
+             .pack(side='left', expand=True)
+
+            self.set_button = Button(self.window, text='Mark UCI as a request resolved', command=self.resolved_button) \
+                .pack(side='left', expand=True)
+
+            self.set_button = Button(self.window, text='Back to UCI search', command=self.back_button) \
+            .pack(side='left', expand=True)
+
+            self.quit_button()
+        return
+
+root = Tk()
+my_gui = class1(root, df, df2)
+root.update()
+root.mainloop()
+
+# handling "back" button
+while marker == True:
+    root = Tk()
+    my_gui = class1(root, df, df2)
+    root.update()
+    root.mainloop()
+else:
+    pass
